@@ -1,6 +1,6 @@
 # Local Kafka-compatible broker pilot
 
-Custodian's standard local PCAP replay does not need Kafka. The broker setup is opt-in and is not started by the application. Phase 4 adds optional Kafka transport adapters and publishes validated replay-stage metadata when Kafka is explicitly enabled. Phase 5 adds a bounded consumer worker with retry and dead-letter handling. Phase 6 adds an optional PostgreSQL inbox for transactional event idempotency and a projection outbox. The existing in-process event hub, replay, and SQLite persistence remain active; the API does not automatically start Kafka consumers or require PostgreSQL.
+Custodian's standard local PCAP replay does not need Kafka. The broker setup is opt-in. When Kafka is explicitly enabled, replay publishes validated metadata. An additional consumer opt-in starts a bounded worker that persists consumed events to PostgreSQL using an idempotent inbox. Redis projection delivery remains a separate follow-up dependent on the Issue 14 live-state contract. The existing in-process event hub and SQLite persistence remain active; Kafka and PostgreSQL are not required for the standard demo.
 
 ## Start the local broker
 
@@ -38,6 +38,8 @@ docker compose -f compose.kafka.yaml down --volumes
 | `CUSTODIAN_KAFKA_TOPIC_PREFIX` | `custodian.v1` | `custodian.v1` |
 | `CUSTODIAN_KAFKA_CONSUMER_GROUP` | `custodian-pilot` | `custodian-pilot` |
 | `CUSTODIAN_KAFKA_MAX_EVENT_BYTES` | `262144` | `262144` |
+| `CUSTODIAN_KAFKA_CONSUMER_ENABLED` | `false` | `false` |
+| `CUSTODIAN_POSTGRES_DSN` | unset | unset |
 
 For example, enable the pilot setting in a shell after starting the broker:
 
@@ -52,7 +54,9 @@ Current configuration validation accepts loopback bootstrap addresses only, incl
 .venv/bin/python -m pip install -e '.[kafka]'
 ```
 
-The API probes the broker at startup and again before replay. When Kafka is enabled, the existing replay stages publish validated packet, flow, feature, verdict, alert, and lifecycle events. The in-process runtime and SQLite persistence remain active. A Kafka consumer can be created by a separate processing component. `KafkaEventWorker` retries a handler a bounded number of times with capped exponential backoff. On exhaustion it publishes a sanitized dead-letter envelope and only then acknowledges the source event. Invalid or oversized input is dead-lettered without copying the original message; if dead-letter publishing fails, its source offset is not committed. Worker diagnostics expose processing, retry, and dead-letter counts. Handlers that write durable records must still use `event_id` as an idempotency key; the PostgreSQL inbox transaction is not implemented by this local pilot.
+The API probes the broker at startup and again before replay. When Kafka is enabled, the existing replay stages publish validated packet, flow, feature, verdict, alert, and lifecycle events. The in-process runtime and SQLite persistence remain active. `KafkaEventWorker` retries a handler a bounded number of times with capped exponential backoff. On exhaustion it publishes a sanitized dead-letter envelope and only then acknowledges the source event. Invalid or oversized input is dead-lettered without copying the original message; if dead-letter publishing fails, its source offset is not committed. Consumer health, processed/retry/dead-letter counts, and failure state appear under `components.pipeline_events.consumer` in readiness and in diagnostics.
+
+To opt into the API-managed Kafka-to-PostgreSQL consumer, install both optional groups, start the local Kafka and PostgreSQL services, and set `CUSTODIAN_KAFKA_ENABLED=true`, `CUSTODIAN_KAFKA_CONSUMER_ENABLED=true`, and `CUSTODIAN_POSTGRES_DSN` in the process environment. The DSN is intentionally environment-only and is never written to diagnostics. Consumer mode requires Kafka mode; startup failures leave the API running but report degraded readiness. This consumer stores validated pipeline events and alert records in PostgreSQL with duplicate-event suppression. Redis delivery from the projection outbox is not part of this consumer yet.
 
 ## Live broker integration check
 
@@ -72,6 +76,6 @@ Install the optional PostgreSQL adapter with:
 .venv/bin/python -m pip install -e '.[postgres]'
 ```
 
-Pass a DSN from a local environment variable or secret store to `PostgresEventStore`; do not commit DSNs or passwords. Call `initialize()` during consumer setup, then wrap the domain handler with `IdempotentEventHandler(store, consumer_name, handler)` and use that wrapper with `KafkaEventWorker`. Inbox claims, event records, alert upserts, the Redis projection outbox item, and callback writes share one PostgreSQL transaction. A duplicate `(consumer_name, event_id)` is acknowledged as an already-processed no-op. If the callback fails, the transaction rolls back and the worker can retry the Kafka record. The API does not enable this consumer mode automatically; the regular demo remains SQLite-backed.
+Pass a DSN from a local environment variable or secret store to `PostgresEventStore`; do not commit DSNs or passwords. The API-managed consumer calls `initialize()` during setup and wraps its handler with `IdempotentEventHandler`. Inbox claims, event records, alert upserts, the Redis projection outbox item, and callback writes share one PostgreSQL transaction. A duplicate `(consumer_name, event_id)` is acknowledged as an already-processed no-op. If the callback fails, the transaction rolls back and the worker can retry the Kafka record. The API does not enable this consumer mode automatically; the regular demo remains SQLite-backed.
 
 Do not put credentials, tokens, secrets, or remote broker addresses in the pilot configuration. The Compose file is for one-laptop development, not production deployment.

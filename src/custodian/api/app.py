@@ -31,7 +31,12 @@ from custodian.core.enums import AlertStatus, CaptureStatus, ReplayMode
 from custodian.core.schemas import AlertRecord, CapturePacketCounts, CaptureRecord
 from custodian.events.bus import EventPublisher
 from custodian.events.contracts import EventType, PipelineEvent
-from custodian.events.kafka import KafkaEventPublisher
+from custodian.events.kafka import (
+    KafkaEventConsumer,
+    KafkaEventPublisher,
+    KafkaEventWorker,
+    KafkaEventWorkerService,
+)
 from custodian.exports import ExportService
 from custodian.ingest.pcap import SUPPORTED_DATALINKS, CaptureReader
 from custodian.ingest.replay import ReplayController
@@ -40,6 +45,7 @@ from custodian.ingestion.validation import CaptureValidator
 from custodian.runtime.engine import CustodianEngine
 from custodian.runtime.events import EventHub
 from custodian.storage import SQLiteRepository
+from custodian.storage.postgres_events import IdempotentEventHandler, PostgresEventStore
 
 API_DESCRIPTION = """
 Local, passive-only API for authorized capture-file analysis. Custodian reads packets from
@@ -99,6 +105,8 @@ class ReplaySession:
         self.event_hub = event_hub or EventHub()
         self.pipeline_publisher = pipeline_publisher
         self.pipeline_error = pipeline_error
+        self.pipeline_consumer_service: KafkaEventWorkerService | None = None
+        self.pipeline_consumer_error: str | None = None
         self.capture_root = config.replay.capture_root.resolve()
         self.validator = CaptureValidator(
             self.capture_root, max_size_bytes=config.replay.max_capture_size_bytes
@@ -449,6 +457,12 @@ class ReplaySession:
                 "mode": "kafka",
                 "status": "degraded",
                 "reason": self.pipeline_error or "Kafka producer is unavailable",
+                "consumer": {
+                    "status": "degraded" if self.config.kafka.consumer_enabled else "disabled",
+                    "reason": self.pipeline_consumer_error or (
+                        "Kafka producer is unavailable" if self.config.kafka.consumer_enabled else None
+                    ),
+                },
             }
         if self.pipeline_error:
             return {
@@ -459,12 +473,28 @@ class ReplaySession:
                 "run_id": str(self.pipeline_run_id) if self.capture else None,
             }
         healthy = getattr(self.pipeline_publisher, "healthy", True)
+        consumer = {"status": "disabled", "reason": None}
+        if self.config.kafka.consumer_enabled:
+            if self.pipeline_consumer_error:
+                consumer = {"status": "degraded", "reason": self.pipeline_consumer_error}
+                healthy = False
+            elif self.pipeline_consumer_service is None:
+                consumer = {"status": "degraded", "reason": "Kafka consumer is unavailable"}
+                healthy = False
+            else:
+                details = self.pipeline_consumer_service.diagnostics
+                consumer = {
+                    "status": "ready" if details["healthy"] and details["running"] else "degraded",
+                    **details,
+                }
+                healthy = healthy and consumer["status"] == "ready"
         return {
             "mode": "kafka",
             "status": "ready" if healthy else "degraded",
             "reason": getattr(self.pipeline_publisher, "last_error", None),
             "backlog": getattr(self.pipeline_publisher, "backlog", None),
             "run_id": str(self.pipeline_run_id) if self.capture else None,
+            "consumer": consumer,
         }
 
 
@@ -472,12 +502,34 @@ def create_app(config: ConfigBundle) -> FastAPI:
     engine = CustodianEngine(config)
     pipeline_publisher = None
     pipeline_error = None
+    pipeline_consumer_service = None
+    pipeline_consumer_error = None
     if config.kafka.enabled:
         try:
             pipeline_publisher = KafkaEventPublisher(config.kafka)
             pipeline_publisher.verify(timeout_seconds=0.5)
-        except Exception as exc:
-            pipeline_error = f"{type(exc).__name__}: {exc}"
+        except Exception:
+            pipeline_error = "Kafka producer could not connect to the configured local broker"
+    if config.kafka.enabled and config.kafka.consumer_enabled:
+        try:
+            if pipeline_publisher is None:
+                raise RuntimeError("Kafka producer is unavailable")
+            assert config.kafka.postgres_dsn is not None
+            store = PostgresEventStore(config.kafka.postgres_dsn.get_secret_value())
+            store.initialize()
+            consumer = KafkaEventConsumer(
+                config.kafka,
+                dead_letter_publisher=pipeline_publisher,
+            )
+            worker = KafkaEventWorker(
+                consumer,
+                IdempotentEventHandler(store, "custodian-pilot"),
+                pipeline_publisher,
+            )
+            pipeline_consumer_service = KafkaEventWorkerService(worker)
+        except Exception:
+            # Keep secrets and driver/broker details out of the API diagnostics.
+            pipeline_consumer_error = "Kafka consumer or PostgreSQL event store could not initialize"
     repository = None
     storage_error = None
     recovery_warnings: list[str] = []
@@ -502,6 +554,8 @@ def create_app(config: ConfigBundle) -> FastAPI:
         pipeline_publisher=pipeline_publisher,
         pipeline_error=pipeline_error,
     )
+    session.pipeline_consumer_service = pipeline_consumer_service
+    session.pipeline_consumer_error = pipeline_consumer_error
     if repository:
         for payload in reversed(repository.list_alerts(limit=min(config.defaults.max_alerts, 500))):
             try:
@@ -511,11 +565,15 @@ def create_app(config: ConfigBundle) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app):
+        if session.pipeline_consumer_service is not None:
+            session.pipeline_consumer_service.start()
         yield
         if session.running and session.controller:
             session.controller.stop()
         if session.thread:
             await asyncio.to_thread(session.thread.join, 2)
+        if session.pipeline_consumer_service is not None:
+            await asyncio.to_thread(session.pipeline_consumer_service.stop, 2.0)
         if session.pipeline_publisher is not None:
             try:
                 await asyncio.to_thread(session.pipeline_publisher.flush, 5.0)

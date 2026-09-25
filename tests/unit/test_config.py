@@ -70,6 +70,26 @@ def test_kafka_environment_overrides_are_applied(monkeypatch) -> None:
     assert bundle.kafka.max_event_bytes == 4096
 
 
+def test_kafka_consumer_requires_opt_in_and_postgres_dsn(monkeypatch) -> None:
+    config_dir = Path(__file__).resolve().parents[2] / "configs"
+    monkeypatch.setenv("CUSTODIAN_KAFKA_CONSUMER_ENABLED", "true")
+    monkeypatch.delenv("CUSTODIAN_KAFKA_ENABLED", raising=False)
+    monkeypatch.delenv("CUSTODIAN_POSTGRES_DSN", raising=False)
+
+    with pytest.raises(ValidationError, match="require Kafka to be enabled"):
+        load_config_bundle(config_dir)
+
+    monkeypatch.setenv("CUSTODIAN_KAFKA_ENABLED", "true")
+    with pytest.raises(ValidationError, match="require CUSTODIAN_POSTGRES_DSN"):
+        load_config_bundle(config_dir)
+
+    monkeypatch.setenv("CUSTODIAN_POSTGRES_DSN", "postgresql://pilot:secret@127.0.0.1/custodian")
+    settings = load_config_bundle(config_dir).kafka
+    assert settings.consumer_enabled
+    assert settings.postgres_dsn is not None
+    assert "secret" not in repr(settings)
+
+
 def test_kafka_local_override_is_loaded_and_remote_servers_are_rejected(
     tmp_path, monkeypatch
 ) -> None:

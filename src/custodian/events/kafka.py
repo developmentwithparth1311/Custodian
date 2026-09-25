@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import UTC, datetime
+from threading import Event, Thread
 from time import monotonic, sleep
 from typing import Any
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -104,7 +105,6 @@ class KafkaEventPublisher:
     @property
     def last_error(self) -> str | None:
         return self._last_error
-
 
 class KafkaEventConsumer:
     """Manual-ack consumer that validates the envelope before returning messages."""
@@ -241,6 +241,22 @@ class KafkaEventConsumer:
     def last_error(self) -> str | None:
         return self._last_error
 
+    @property
+    def backlog(self) -> int | None:
+        """Best-effort assigned-partition lag; None when broker metadata is unavailable."""
+        try:
+            assignments = self._consumer.assignment()
+            positions = self._consumer.position(assignments)
+            lag = 0
+            for partition, position in zip(assignments, positions, strict=True):
+                _, high_watermark = self._consumer.get_watermark_offsets(partition, timeout=0.1)
+                current = getattr(position, "offset", -1)
+                if current >= 0:
+                    lag += max(0, high_watermark - current)
+            return lag
+        except Exception:
+            return None
+
 
 class KafkaEventWorker:
     """Process one event at a time with bounded retries and a sanitized dead letter."""
@@ -348,11 +364,58 @@ class KafkaEventWorker:
         return {
             "healthy": self.healthy,
             "consumer_healthy": self.consumer.healthy,
+            "consumer_backlog": self.consumer.backlog,
             "processed_count": self.processed_count,
             "retry_count": self.retry_count,
             "dead_letter_count": self.dead_letter_count + self.consumer.dead_letter_count,
             "last_error": self.last_error or self.consumer.last_error,
         }
+
+
+class KafkaEventWorkerService:
+    """Lifecycle wrapper that runs a worker in a stoppable background thread."""
+
+    def __init__(self, worker: KafkaEventWorker, *, poll_timeout_seconds: float = 0.5) -> None:
+        if poll_timeout_seconds <= 0:
+            raise ValueError("poll_timeout_seconds must be positive")
+        self.worker = worker
+        self.poll_timeout_seconds = poll_timeout_seconds
+        self._stop = Event()
+        self._thread: Thread | None = None
+        self.last_error: str | None = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self.last_error = None
+        self._thread = Thread(target=self._run, name="custodian-kafka-consumer", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.worker.process_next(timeout_seconds=self.poll_timeout_seconds)
+            except Exception:
+                # Do not leak broker payloads, DSNs, or exception text into diagnostics.
+                self.last_error = "Kafka consumer worker stopped after a processing failure"
+                return
+
+    def stop(self, timeout_seconds: float = 2.0) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout_seconds)
+        close = getattr(self.worker.consumer, "close", None)
+        if close is not None:
+            close()
+
+    @property
+    def diagnostics(self) -> dict[str, int | bool | str | None]:
+        result = dict(self.worker.diagnostics)
+        result["running"] = bool(self._thread and self._thread.is_alive())
+        result["last_error"] = self.last_error or result["last_error"]
+        return result
 
 
 class KafkaEventBus:
@@ -374,4 +437,5 @@ __all__ = [
     "KafkaEventConsumer",
     "KafkaEventPublisher",
     "KafkaEventWorker",
+    "KafkaEventWorkerService",
 ]

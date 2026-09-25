@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from custodian.core.enums import FeatureFamily, ReplayMode
 
@@ -165,9 +165,17 @@ class KafkaSettings(SettingsModel):
     )
     consumer_group: str = Field(default="custodian-pilot", min_length=1, max_length=128)
     max_event_bytes: int = Field(default=262_144, gt=0, le=16_777_216)
+    consumer_enabled: bool = False
+    postgres_dsn: SecretStr | None = Field(default=None, repr=False)
 
     @model_validator(mode="after")
     def validate_local_bootstrap_servers(self) -> KafkaSettings:
+        if self.consumer_enabled and not self.enabled:
+            raise ValueError("Kafka consumers require Kafka to be enabled")
+        if self.consumer_enabled and not self.postgres_dsn:
+            raise ValueError("Kafka consumers require CUSTODIAN_POSTGRES_DSN")
+        if self.postgres_dsn is not None and not self.postgres_dsn.get_secret_value().strip():
+            raise ValueError("PostgreSQL DSN must not be empty")
         if not self.bootstrap_servers:
             raise ValueError("at least one Kafka bootstrap server is required")
         for server in self.bootstrap_servers:
@@ -233,6 +241,17 @@ def _load_kafka_settings(directory: Path) -> KafkaSettings:
         if normalized not in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
             raise ValueError("CUSTODIAN_KAFKA_ENABLED must be a boolean value")
         environment_values["enabled"] = normalized in {"true", "1", "yes", "on"}
+
+    consumer_enabled = os.environ.get("CUSTODIAN_KAFKA_CONSUMER_ENABLED")
+    if consumer_enabled is not None:
+        normalized = consumer_enabled.strip().lower()
+        if normalized not in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
+            raise ValueError("CUSTODIAN_KAFKA_CONSUMER_ENABLED must be a boolean value")
+        environment_values["consumer_enabled"] = normalized in {"true", "1", "yes", "on"}
+
+    postgres_dsn = os.environ.get("CUSTODIAN_POSTGRES_DSN")
+    if postgres_dsn is not None:
+        environment_values["postgres_dsn"] = postgres_dsn
 
     bootstrap_servers = os.environ.get("CUSTODIAN_KAFKA_BOOTSTRAP_SERVERS")
     if bootstrap_servers is not None:
