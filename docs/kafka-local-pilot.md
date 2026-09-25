@@ -1,6 +1,6 @@
 # Local Kafka-compatible broker pilot
 
-Custodian's standard local PCAP replay does not need Kafka. The broker setup is opt-in and is not started by the application. Phase 4 adds optional Kafka transport adapters and publishes validated replay-stage metadata when Kafka is explicitly enabled. Phase 5 adds a bounded consumer worker with retry and dead-letter handling. The existing in-process event hub, replay, and SQLite persistence remain active. PostgreSQL/Redis projections and durable inbox-based idempotency remain later work.
+Custodian's standard local PCAP replay does not need Kafka. The broker setup is opt-in and is not started by the application. Phase 4 adds optional Kafka transport adapters and publishes validated replay-stage metadata when Kafka is explicitly enabled. Phase 5 adds a bounded consumer worker with retry and dead-letter handling. Phase 6 adds an optional PostgreSQL inbox for transactional event idempotency and a projection outbox. The existing in-process event hub, replay, and SQLite persistence remain active; the API does not automatically start Kafka consumers or require PostgreSQL.
 
 ## Start the local broker
 
@@ -63,5 +63,15 @@ CUSTODIAN_KAFKA_INTEGRATION=1 .venv/bin/python -m pytest tests/integration/test_
 ```
 
 The tests provision their versioned topics if needed, publish and consume a metadata-only runtime event, and send a malformed schema-only record through the sanitized dead-letter path. Set `CUSTODIAN_KAFKA_BOOTSTRAP_SERVERS` to another loopback Kafka-compatible address if the broker uses a non-default port. The tests do not run in the default suite and reject non-loopback broker addresses through normal Kafka settings validation.
+
+## PostgreSQL-backed consumer idempotency
+
+Install the optional PostgreSQL adapter with:
+
+```sh
+.venv/bin/python -m pip install -e '.[postgres]'
+```
+
+Pass a DSN from a local environment variable or secret store to `PostgresEventStore`; do not commit DSNs or passwords. Call `initialize()` during consumer setup, then wrap the domain handler with `IdempotentEventHandler(store, consumer_name, handler)` and use that wrapper with `KafkaEventWorker`. Inbox claims, event records, alert upserts, the Redis projection outbox item, and callback writes share one PostgreSQL transaction. A duplicate `(consumer_name, event_id)` is acknowledged as an already-processed no-op. If the callback fails, the transaction rolls back and the worker can retry the Kafka record. The API does not enable this consumer mode automatically; the regular demo remains SQLite-backed.
 
 Do not put credentials, tokens, secrets, or remote broker addresses in the pilot configuration. The Compose file is for one-laptop development, not production deployment.

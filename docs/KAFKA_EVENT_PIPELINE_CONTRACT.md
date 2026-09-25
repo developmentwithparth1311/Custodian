@@ -123,7 +123,13 @@ When `kafka.enabled` is true, the API creates and probes the Kafka producer. Rep
 
 `KafkaEventWorker` runs one validated event at a time and requires a synchronous handler. Handler failures receive a bounded number of attempts with capped exponential backoff. Exhausted failures become metadata-only `dead_letter.v1` events that carry the source event ID and `causation_id`, but never the original message or exception text. Invalid schema/topic and over-limit messages also produce sanitized dead-letter records. Source offsets are committed only after successful processing or successful dead-letter delivery. Worker diagnostics expose health, processed count, retry count, dead-letter count, and the last sanitized failure summary.
 
-This worker does not itself make arbitrary handler side effects idempotent. Durable Kafka-mode processing still requires the planned PostgreSQL inbox transaction keyed by `(consumer_name, event_id)` and corresponding transactional domain writes; Redis projection remains an independent rebuildable layer.
+## Phase 6 durable idempotency baseline
+
+`PostgresEventStore` adds a PostgreSQL inbox keyed by `(consumer_name, event_id)`. The inbox claim, durable pipeline-event record, alert upsert, projection-outbox insert, and optional consumer-specific database callback run in one PostgreSQL transaction. Duplicate delivery for one consumer is a successful no-op. A callback failure rolls back the inbox claim and all database writes so Kafka can redeliver safely. Stable `alert_id` values are upserted without incrementing `occurrence_count` from duplicate delivery. Each consumer callback must use the supplied connection for any side effects that must share this transaction.
+
+Install the optional database adapter with `pip install -e '.[postgres]'`. Construct `PostgresEventStore` with a DSN supplied from a local secret/environment variable, call `initialize()` during service setup, and pass `IdempotentEventHandler(store, consumer_name, callback)` as the `KafkaEventWorker` handler. The adapter is not selected by the FastAPI replay process yet; its default SQLite-only demo remains unchanged. PostgreSQL-backed consumer deployment must use this handler (or an equivalent transactional inbox) before enabling durable Kafka consumers.
+
+`custodian_projection_outbox` records the validated event in the same PostgreSQL transaction. Delivering those outbox records to Redis is a separate idempotent projection worker; it is intentionally not performed inside the PostgreSQL transaction. Redis remains a rebuildable live-state cache.
 
 ## Phase 1 exit criteria
 

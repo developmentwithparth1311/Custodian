@@ -40,6 +40,9 @@ dev = [
 kafka = [
     "confluent-kafka>=2.15,<3",
 ]
+postgres = [
+    "psycopg[binary]>=3.2,<4",
+]
 
 [tool.setuptools.packages.find]
 where = ["src", "."]
