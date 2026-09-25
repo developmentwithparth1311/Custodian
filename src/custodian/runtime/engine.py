@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +24,7 @@ from custodian.core.schemas import CapabilityProfile, FeatureVector, FlowRecord,
 from custodian.detection.behaviour import BehaviourDetector
 from custodian.detection.dns import DNSDetector
 from custodian.detection.tls_quic import TLSQUICDetector
+from custodian.events.contracts import EventType
 from custodian.evidence.gate import EvidenceGate, GateResult
 from custodian.features.behaviour import BehaviourFeatureExtractor
 from custodian.features.dns import DNSFeatureExtractor
@@ -87,6 +89,15 @@ class CustodianEngine:
         self._watermark: datetime | None = None
         self.mode = config.replay.mode
         self.capture_id: str | None = None
+        self.event_sink: Callable[[EventType, dict, datetime], None] | None = None
+
+    def set_event_sink(self, sink: Callable[[EventType, dict, datetime], None] | None) -> None:
+        """Set an optional transport-neutral sink for validated pipeline metadata."""
+        self.event_sink = sink
+
+    def _emit_pipeline_event(self, event_type: EventType, payload: dict, occurred_at: datetime):
+        if self.event_sink is not None:
+            self.event_sink(event_type, payload, occurred_at)
 
     def _package(self, family: str, entry=None, *, detector_id: str | None = None):
         entry = entry or self.config.models.models[family]
@@ -177,7 +188,7 @@ class CustodianEngine:
                     "model_version": package.model_version if package else None,
                     "schema_version": package.feature_schema["schema_version"]
                     if package
-                        else f"{family}.v1",
+                    else f"{family}.v1",
                     "classes": list(package.classes) if package else [],
                     "artifact_trusted": entry.trusted,
                     "required_evidence": list(
@@ -198,6 +209,14 @@ class CustodianEngine:
         if packet_count == self._last_snapshot_counts.get(flow.flow_id):
             return []
         self._last_snapshot_counts[flow.flow_id] = packet_count
+        self._emit_pipeline_event(
+            EventType.FLOW_UPDATE,
+            {
+                "update_kind": "closed" if flow.close_reason else "snapshot",
+                "flow": flow.model_dump(mode="json"),
+            },
+            flow.last_seen,
+        )
         started = perf_counter()
         source = flow.initiator or flow.endpoint_a
         destination = flow.endpoint_b if source == flow.endpoint_a else flow.endpoint_a
@@ -248,6 +267,12 @@ class CustodianEngine:
             tls_vector = self.tls_features.extract(flow, state, capabilities)
             vectors.extend((detector_id, tls_vector) for detector_id in tls_detector_ids)
         self.metrics.feature_vectors += len(vectors)
+        for _detector_id, vector in vectors:
+            self._emit_pipeline_event(
+                EventType.FEATURE_VECTOR,
+                vector.model_dump(mode="json"),
+                flow.last_seen,
+            )
         self.metrics.record_latency("features", (perf_counter() - started) * 1000)
         emitted = []
         for detector_id, vector in vectors:
@@ -334,6 +359,11 @@ class CustodianEngine:
                     },
                 }
             )
+            self._emit_pipeline_event(
+                EventType.DETECTOR_VERDICT,
+                verdict.model_dump(mode="json"),
+                job.flow.last_seen,
+            )
             started = perf_counter()
             threshold = detector.package.thresholds.get(verdict.threat_class.value)
             gate = self.evidence_gate.evaluate(verdict, job.capabilities, threshold)
@@ -362,6 +392,11 @@ class CustodianEngine:
             )
             if alert:
                 alert, is_new = self.dedupe.merge(alert)
+                self._emit_pipeline_event(
+                    EventType.ALERT,
+                    alert.model_dump(mode="json"),
+                    alert.emitted_at or alert.timestamp,
+                )
                 if is_new:
                     self.alerts.append(alert)
                     self.metrics.record_alert()
@@ -421,6 +456,11 @@ class CustodianEngine:
             self.metrics.skipped_frames += 1
             self.metrics.record_parse_failure(parse_status)
             return self.flush_due()
+        self._emit_pipeline_event(
+            EventType.PACKET_OBSERVATION,
+            packet.model_dump(mode="json"),
+            packet.timestamp,
+        )
         if self._watermark is not None and packet.timestamp < self._watermark:
             self.metrics.out_of_order_packets += 1
             return self.flush_due()

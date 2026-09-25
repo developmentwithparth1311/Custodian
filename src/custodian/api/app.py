@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from hashlib import sha256
 from ipaddress import ip_address
 from pathlib import Path
@@ -28,6 +29,9 @@ from custodian.api.auth import (
 from custodian.config import ConfigBundle, load_config_bundle
 from custodian.core.enums import AlertStatus, CaptureStatus, ReplayMode
 from custodian.core.schemas import AlertRecord, CapturePacketCounts, CaptureRecord
+from custodian.events.bus import EventPublisher
+from custodian.events.contracts import EventType, PipelineEvent
+from custodian.events.kafka import KafkaEventPublisher
 from custodian.exports import ExportService
 from custodian.ingest.pcap import SUPPORTED_DATALINKS, CaptureReader
 from custodian.ingest.replay import ReplayController
@@ -87,10 +91,14 @@ class ReplaySession:
         config: ConfigBundle,
         repository: SQLiteRepository | None = None,
         event_hub: EventHub | None = None,
+        pipeline_publisher: EventPublisher | None = None,
+        pipeline_error: str | None = None,
     ) -> None:
         self.engine, self.config = engine, config
         self.repository = repository
         self.event_hub = event_hub or EventHub()
+        self.pipeline_publisher = pipeline_publisher
+        self.pipeline_error = pipeline_error
         self.capture_root = config.replay.capture_root.resolve()
         self.validator = CaptureValidator(
             self.capture_root, max_size_bytes=config.replay.max_capture_size_bytes
@@ -103,8 +111,42 @@ class ReplaySession:
         self.error: str | None = None
         self.state = "IDLE"
         self.run_id = 0
+        self.pipeline_run_id = uuid4()
+        self.pipeline_correlation_id = uuid4()
+        self.pipeline_sequence = 0
         self.capture_size_bytes = 0
         self._lock = RLock()
+        self.engine.set_event_sink(self._publish_pipeline_event)
+
+    def _publish_pipeline_event(
+        self, event_type: EventType, payload: dict, occurred_at: datetime
+    ) -> None:
+        if self.pipeline_publisher is None:
+            return
+        with self._lock:
+            self.pipeline_sequence += 1
+            event = PipelineEvent(
+                event_id=uuid4(),
+                event_type=event_type,
+                schema_version=f"{event_type.value}.v1",
+                occurred_at=occurred_at,
+                run_id=self.pipeline_run_id,
+                capture_id=self.engine.capture_id,
+                correlation_id=self.pipeline_correlation_id,
+                sequence=self.pipeline_sequence,
+                payload=payload,
+            )
+            self.pipeline_publisher.publish(event, timeout_seconds=0.25)
+
+    def _publish_pipeline_runtime_event(self, event_type: str) -> None:
+        if self.pipeline_publisher is None or not event_type.startswith("replay."):
+            return
+        state = event_type.removeprefix("replay.")
+        self._publish_pipeline_event(
+            EventType.RUNTIME_EVENT,
+            {"name": event_type, "state": state, "details": {"event_type": event_type}},
+            datetime.now(UTC),
+        )
 
     def _publish(self, event_type: str, payload: dict) -> None:
         event = self.event_hub.publish(event_type, payload, run_id=self.run_id)
@@ -112,6 +154,7 @@ class ReplaySession:
             self.repository.record_event(
                 event.event_id, event.event_type, event.model_dump(mode="json")
             )
+        self._publish_pipeline_runtime_event(event_type)
 
     def validate(self, capture: str):
         with self._lock:
@@ -185,6 +228,20 @@ class ReplaySession:
     def start(
         self, capture: str, mode: ReplayMode | None = None, speed_multiplier: float | None = None
     ) -> None:
+        if self.config.kafka.enabled:
+            if self.pipeline_publisher is None:
+                raise RuntimeError(
+                    "Kafka mode is enabled but its producer is unavailable: "
+                    f"{self.pipeline_error or 'Kafka client is not configured'}"
+                )
+            verify = getattr(self.pipeline_publisher, "verify", None)
+            if verify is not None:
+                try:
+                    verify(timeout_seconds=1.0)
+                    self.pipeline_error = None
+                except Exception as exc:
+                    self.pipeline_error = str(exc)
+                    raise RuntimeError("configured Kafka broker is unavailable") from exc
         with self._lock:
             if self.running:
                 raise RuntimeError("a replay is already running")
@@ -210,6 +267,9 @@ class ReplaySession:
             self.capture_size_bytes = reader.size_bytes
             self.state, self.running = "RUNNING", True
             self.run_id += 1
+            self.pipeline_run_id = uuid4()
+            self.pipeline_correlation_id = uuid4()
+            self.pipeline_sequence = 0
             controller = self.controller
             self._set_capture_status(CaptureStatus.RUNNING)
             self._publish("replay.started", {"capture": capture, "mode": controller.mode.value})
@@ -250,6 +310,11 @@ class ReplaySession:
             finally:
                 with self._lock:
                     self.running = False
+                if self.pipeline_publisher is not None:
+                    try:
+                        self.pipeline_publisher.flush(5.0)
+                    except Exception as exc:
+                        self.pipeline_error = f"{type(exc).__name__}: {exc}"
 
         self.thread = Thread(target=run, name="custodian-passive-replay", daemon=True)
         self.thread.start()
@@ -372,12 +437,47 @@ class ReplaySession:
             "checkpoint_origin_progress": 0.0 if controller else None,
             "error": self.error,
             "run_id": self.run_id,
+            "event_pipeline": self.event_pipeline_status(),
             "telemetry_interval_ms": round(self.telemetry_interval * 1000),
+        }
+
+    def event_pipeline_status(self) -> dict:
+        if not self.config.kafka.enabled:
+            return {"mode": "in_process", "status": "disabled", "reason": None}
+        if self.pipeline_publisher is None:
+            return {
+                "mode": "kafka",
+                "status": "degraded",
+                "reason": self.pipeline_error or "Kafka producer is unavailable",
+            }
+        if self.pipeline_error:
+            return {
+                "mode": "kafka",
+                "status": "degraded",
+                "reason": self.pipeline_error,
+                "backlog": getattr(self.pipeline_publisher, "backlog", None),
+                "run_id": str(self.pipeline_run_id) if self.capture else None,
+            }
+        healthy = getattr(self.pipeline_publisher, "healthy", True)
+        return {
+            "mode": "kafka",
+            "status": "ready" if healthy else "degraded",
+            "reason": getattr(self.pipeline_publisher, "last_error", None),
+            "backlog": getattr(self.pipeline_publisher, "backlog", None),
+            "run_id": str(self.pipeline_run_id) if self.capture else None,
         }
 
 
 def create_app(config: ConfigBundle) -> FastAPI:
     engine = CustodianEngine(config)
+    pipeline_publisher = None
+    pipeline_error = None
+    if config.kafka.enabled:
+        try:
+            pipeline_publisher = KafkaEventPublisher(config.kafka)
+            pipeline_publisher.verify(timeout_seconds=0.5)
+        except Exception as exc:
+            pipeline_error = f"{type(exc).__name__}: {exc}"
     repository = None
     storage_error = None
     recovery_warnings: list[str] = []
@@ -394,7 +494,14 @@ def create_app(config: ConfigBundle) -> FastAPI:
             storage_error = str(exc)
             repository = None
     event_hub = EventHub(max_events=min(config.defaults.max_temporal_events, 5000))
-    session = ReplaySession(engine, config, repository, event_hub)
+    session = ReplaySession(
+        engine,
+        config,
+        repository,
+        event_hub,
+        pipeline_publisher=pipeline_publisher,
+        pipeline_error=pipeline_error,
+    )
     if repository:
         for payload in reversed(repository.list_alerts(limit=min(config.defaults.max_alerts, 500))):
             try:
@@ -409,6 +516,11 @@ def create_app(config: ConfigBundle) -> FastAPI:
             session.controller.stop()
         if session.thread:
             await asyncio.to_thread(session.thread.join, 2)
+        if session.pipeline_publisher is not None:
+            try:
+                await asyncio.to_thread(session.pipeline_publisher.flush, 5.0)
+            except Exception as exc:
+                session.pipeline_error = f"{type(exc).__name__}: {exc}"
 
     app = FastAPI(
         title="Custodian API",
@@ -422,6 +534,7 @@ def create_app(config: ConfigBundle) -> FastAPI:
     )
     app.state.engine, app.state.session = engine, session
     app.state.repository, app.state.event_hub = repository, event_hub
+    app.state.pipeline_publisher = pipeline_publisher
 
     @app.middleware("http")
     async def correlation_id(request: Request, call_next):
@@ -572,15 +685,18 @@ def create_app(config: ConfigBundle) -> FastAPI:
             for item in model_status
         }
         database_ready = repository is not None and not recovery_warnings
+        event_pipeline = session.event_pipeline_status()
+        pipeline_ready = event_pipeline["status"] in {"ready", "disabled"}
         return {
             "status": "ready"
-            if database_ready and all(item["enabled"] for item in model_status)
+            if database_ready and all(item["enabled"] for item in model_status) and pipeline_ready
             else "degraded",
             "passive_only": True,
             "outbound_traffic_path": False,
             "components": {
                 "parser": {"status": "ready", "reason": None},
                 "event_stream": {"status": "ready", "reason": None},
+                "pipeline_events": event_pipeline,
                 "database": {
                     "status": "degraded"
                     if recovery_warnings
@@ -754,6 +870,7 @@ def create_app(config: ConfigBundle) -> FastAPI:
             "routing": list(engine.routing_diagnostics),
             "model_load_errors": dict(engine._load_errors),
             "inputs": adapter_statuses(),
+            "event_pipeline": session.event_pipeline_status(),
         }
 
     @app.get("/api/v1/events", tags=["events"], summary="Poll events after a sequence cursor")

@@ -9,6 +9,7 @@ import dpkt
 from custodian.config import load_config_bundle
 from custodian.core.enums import AlertDecision, ThreatClass
 from custodian.core.schemas import DetectorVerdict
+from custodian.events.contracts import EventType
 from custodian.runtime.engine import CustodianEngine
 
 
@@ -113,3 +114,18 @@ def test_telemetry_cache_and_reset_are_bounded():
     assert engine.metrics.snapshot()["packets"] == 0
     assert engine.state.event_count == 0
     assert engine.flows.active_flow_count == 0
+
+
+def test_optional_event_sink_emits_metadata_at_pipeline_boundaries():
+    engine = CustodianEngine(config())
+    emitted = []
+    engine.set_event_sink(lambda event_type, payload, at: emitted.append((event_type, payload, at)))
+
+    engine.process_frame(100, frame())
+    engine.finish()
+
+    event_types = [event_type for event_type, _payload, _at in emitted]
+    assert event_types[0] is EventType.PACKET_OBSERVATION
+    assert EventType.FLOW_UPDATE in event_types
+    assert EventType.FEATURE_VECTOR in event_types
+    assert all("raw_payload" not in payload for _kind, payload, _at in emitted)

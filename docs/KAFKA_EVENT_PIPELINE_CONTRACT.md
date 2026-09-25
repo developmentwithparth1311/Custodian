@@ -113,6 +113,12 @@ The local bus is a bounded FIFO queue. Queue saturation raises an explicit backp
 
 `compose.kafka.yaml` defines one opt-in Redpanda broker with a health check, one CPU core, persistent named data, and only the Kafka host port bound to `127.0.0.1:9092`. See `docs/kafka-local-pilot.md` for start/stop instructions. The broker and setting do not change runtime mode or enable live capture; Kafka transport implementation remains a later phase.
 
+## Phase 4 implementation baseline
+
+`KafkaEventPublisher` and `KafkaEventConsumer` use the optional `confluent-kafka` dependency, loaded only when Kafka is enabled. The publisher enables broker idempotence, validates serialized size, uses `capture_id:run_id` as its partition key, and surfaces producer queue or delivery errors. The consumer disables automatic offset commits, validates the envelope and topic before returning it, and commits only after the caller explicitly acknowledges the event. It permits one outstanding message per consumer to preserve processing order. Invalid messages remain unacknowledged and block that consumer pending operator handling; dead-letter routing and bounded retry policy remain Phase 5 work.
+
+When `kafka.enabled` is true, the API creates and probes the Kafka producer. Replay starts fail safely if the configured producer or broker is unavailable. The replay session emits packet observations, flow snapshots/closures, feature vectors, detector verdicts, alerts, and replay lifecycle events through a transport-neutral engine callback. All receive per-run UUIDs, capture IDs, correlation IDs, and a sequence assigned under the session lock. The existing EventHub, SQLite persistence, and synchronous inference path continue running locally; this phase publishes stage outputs for future consumers and does not yet replace local stage execution. Readiness and diagnostics report Kafka producer state and backlog. With Kafka disabled, no Kafka client is imported or required.
+
 ## Phase 1 exit criteria
 
 - Runtime event boundaries and current local persistence are mapped to the proposed stages.

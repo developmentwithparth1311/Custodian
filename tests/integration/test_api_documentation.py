@@ -125,9 +125,7 @@ def test_documented_http_examples_work_locally(tmp_path: Path) -> None:
     write_documented_capture(capture_path)
 
     with TestClient(app) as client:
-        health = client.get(
-            "/api/v1/health", headers={"X-Correlation-ID": "docs-example-001"}
-        )
+        health = client.get("/api/v1/health", headers={"X-Correlation-ID": "docs-example-001"})
         assert health.status_code == 200
         assert health.json() == {"status": "ok", "return_path": "NONE"}
         assert health.headers["X-Correlation-ID"] == "docs-example-001"
@@ -141,7 +139,9 @@ def test_documented_http_examples_work_locally(tmp_path: Path) -> None:
             "database",
             "models",
             "inputs",
+            "pipeline_events",
         }
+        assert readiness["components"]["pipeline_events"]["status"] == "disabled"
 
         status = client.get("/api/v1/status").json()
         assert client.get("/api/v1/replay/status").json() == status
@@ -150,9 +150,7 @@ def test_documented_http_examples_work_locally(tmp_path: Path) -> None:
 
         captures = client.get("/api/v1/captures").json()
         assert [item["display_name"] for item in captures] == ["http.cap"]
-        validated = client.post(
-            "/api/v1/captures/validate", json={"capture": "http.cap"}
-        )
+        validated = client.post("/api/v1/captures/validate", json={"capture": "http.cap"})
         assert validated.status_code == 200
         assert validated.json()["status"] == "ready"
         assert validated.json()["sha256"]
@@ -174,24 +172,22 @@ def test_documented_http_examples_work_locally(tmp_path: Path) -> None:
         telemetry = client.get("/api/v1/telemetry").json()
         assert set(telemetry) == {"status", "metrics", "detectors"}
         assert client.get("/api/v1/alerts?limit=100&offset=0").json() == []
-        assert client.get("/api/v1/models").json() == client.get(
-            "/api/v1/detectors"
-        ).json()
+        assert client.get("/api/v1/models").json() == client.get("/api/v1/detectors").json()
         assert client.get("/api/v1/flows?limit=100").json() == []
         assert client.get("/api/v1/timeline?limit=100").json() == []
         assert set(client.get("/api/v1/diagnostics").json()) == {
             "routing",
             "model_load_errors",
             "inputs",
+            "event_pipeline",
         }
+        assert client.get("/api/v1/diagnostics").json()["event_pipeline"]["status"] == "disabled"
 
         events = client.get("/api/v1/events?after_sequence=0&limit=200").json()
         assert events["events"]
         assert events["latest_sequence"] >= events["events"][-1]["sequence"]
 
-        exported = client.post(
-            "/api/v1/exports", json={"format": "json", "anonymize": True}
-        )
+        exported = client.post("/api/v1/exports", json={"format": "json", "anonymize": True})
         assert exported.status_code == 200
         assert exported.json()["status"] == "created"
         assert exported.json()["anonymized"] is True

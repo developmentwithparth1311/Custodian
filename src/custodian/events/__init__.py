@@ -16,6 +16,7 @@ from custodian.events.contracts import (
     PipelineEvent,
     RuntimeEventPayload,
 )
+from custodian.events.kafka import KafkaEventBus, KafkaEventConsumer, KafkaEventPublisher
 
 __all__ = [
     "EVENT_TOPICS",
@@ -28,6 +29,9 @@ __all__ = [
     "EventType",
     "FlowUpdatePayload",
     "InProcessEventBus",
+    "KafkaEventBus",
+    "KafkaEventConsumer",
+    "KafkaEventPublisher",
     "PipelineEvent",
     "RuntimeEventPayload",
 ]

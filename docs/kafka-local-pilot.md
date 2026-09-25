@@ -46,6 +46,12 @@ export CUSTODIAN_KAFKA_ENABLED=true
 export CUSTODIAN_KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9092
 ```
 
-Current configuration validation accepts loopback bootstrap addresses only, including `localhost` and loopback IPs. It rejects remote broker endpoints for this local pilot. The setting does not yet connect a producer or consumer; the default application remains on its existing in-process replay path.
+Current configuration validation accepts loopback bootstrap addresses only, including `localhost` and loopback IPs. It rejects remote broker endpoints for this local pilot. Kafka mode needs the optional client extra:
+
+```sh
+.venv/bin/python -m pip install -e '.[kafka]'
+```
+
+The API probes the broker at startup and again before replay. When Kafka is enabled, the existing replay stages publish validated packet, flow, feature, verdict, alert, and lifecycle events. The in-process runtime and SQLite persistence remain active. A Kafka consumer can be created by a separate processing component; it must acknowledge a validated event after processing. Invalid messages are not committed and block that consumer until dead-letter handling is added in Phase 5.
 
 Do not put credentials, tokens, secrets, or remote broker addresses in the pilot configuration. The Compose file is for one-laptop development, not production deployment.
