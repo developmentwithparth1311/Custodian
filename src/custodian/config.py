@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from pathlib import Path
 from typing import Any, TypeVar
@@ -137,7 +138,9 @@ class ModelsSettings(SettingsModel):
                     f"{family.value} cannot be trusted unless it is enabled with an artifact path"
                 )
             for name in entry.variants:
-                if not name or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in name):
+                if not name or any(
+                    character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in name
+                ):
                     raise ValueError(f"invalid {family.value} model variant name: {name!r}")
         return self
 
@@ -149,6 +152,41 @@ class StorageSettings(SettingsModel):
     max_database_bytes: int = Field(default=1_073_741_824, gt=0)
 
 
+class KafkaSettings(SettingsModel):
+    """Optional local Kafka-compatible broker settings; disabled by default."""
+
+    enabled: bool = False
+    bootstrap_servers: tuple[str, ...] = ("127.0.0.1:9092",)
+    topic_prefix: str = Field(
+        default="custodian.v1",
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+    )
+    consumer_group: str = Field(default="custodian-pilot", min_length=1, max_length=128)
+    max_event_bytes: int = Field(default=262_144, gt=0, le=16_777_216)
+
+    @model_validator(mode="after")
+    def validate_local_bootstrap_servers(self) -> KafkaSettings:
+        if not self.bootstrap_servers:
+            raise ValueError("at least one Kafka bootstrap server is required")
+        for server in self.bootstrap_servers:
+            host, separator, port_text = server.rpartition(":")
+            if not separator or not host or not port_text.isdigit():
+                raise ValueError(f"invalid Kafka bootstrap server: {server!r}")
+            if host.startswith("[") and host.endswith("]"):
+                host = host[1:-1]
+            try:
+                is_loopback = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                is_loopback = host.lower() == "localhost"
+            if not is_loopback:
+                raise ValueError("Kafka pilot bootstrap servers must use loopback addresses")
+            if not 1 <= int(port_text) <= 65535:
+                raise ValueError(f"invalid Kafka bootstrap port in {server!r}")
+        return self
+
+
 class ConfigBundle(SettingsModel):
     defaults: DefaultSettings
     replay: ReplaySettings
@@ -156,6 +194,7 @@ class ConfigBundle(SettingsModel):
     severity: SeveritySettings
     models: ModelsSettings
     storage: StorageSettings
+    kafka: KafkaSettings = Field(default_factory=KafkaSettings)
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -170,6 +209,48 @@ def _load_yaml(path: Path) -> dict[str, Any]:
 
 def _validate_file(path: Path, model: type[ConfigType]) -> ConfigType:
     return model.model_validate(_load_yaml(path))
+
+
+def _load_kafka_settings(directory: Path) -> KafkaSettings:
+    settings = _load_yaml(directory / "kafka.yaml")
+
+    # The ignored local file overlays repository defaults and must contain no secrets.
+    local_path = directory / "kafka.local.yaml"
+    if local_path.is_file():
+        settings.update(_load_yaml(local_path))
+
+    selected_path = os.environ.get("CUSTODIAN_KAFKA_CONFIG")
+    if selected_path:
+        config_path = Path(selected_path)
+        if not config_path.is_absolute():
+            config_path = directory / config_path
+        settings.update(_load_yaml(config_path))
+
+    environment_values: dict[str, Any] = {}
+    enabled = os.environ.get("CUSTODIAN_KAFKA_ENABLED")
+    if enabled is not None:
+        normalized = enabled.strip().lower()
+        if normalized not in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
+            raise ValueError("CUSTODIAN_KAFKA_ENABLED must be a boolean value")
+        environment_values["enabled"] = normalized in {"true", "1", "yes", "on"}
+
+    bootstrap_servers = os.environ.get("CUSTODIAN_KAFKA_BOOTSTRAP_SERVERS")
+    if bootstrap_servers is not None:
+        environment_values["bootstrap_servers"] = tuple(
+            server.strip() for server in bootstrap_servers.split(",") if server.strip()
+        )
+
+    for environment_name, setting_name in (
+        ("CUSTODIAN_KAFKA_TOPIC_PREFIX", "topic_prefix"),
+        ("CUSTODIAN_KAFKA_CONSUMER_GROUP", "consumer_group"),
+        ("CUSTODIAN_KAFKA_MAX_EVENT_BYTES", "max_event_bytes"),
+    ):
+        value = os.environ.get(environment_name)
+        if value is not None:
+            environment_values[setting_name] = value
+
+    settings.update(environment_values)
+    return KafkaSettings.model_validate(settings)
 
 
 def load_config_bundle(config_dir: str | Path) -> ConfigBundle:
@@ -187,6 +268,7 @@ def load_config_bundle(config_dir: str | Path) -> ConfigBundle:
         severity=_validate_file(directory / "severity.yaml", SeveritySettings),
         models=_validate_file(models_path, ModelsSettings),
         storage=_validate_file(directory / "storage.yaml", StorageSettings),
+        kafka=_load_kafka_settings(directory),
     )
     root = directory.resolve().parent
 

@@ -1,0 +1,7 @@
+# Kafka is opt-in. Standard PCAP replay does not require a broker.
+enabled: false
+bootstrap_servers:
+  - 127.0.0.1:9092
+topic_prefix: custodian.v1
+consumer_group: custodian-pilot
+max_event_bytes: 262144

@@ -107,6 +107,12 @@ The transport-neutral contracts live in `src/custodian/events/`:
 
 The local bus is a bounded FIFO queue. Queue saturation raises an explicit backpressure error; it never silently drops an event. Empty polls return `None`. This adapter is available for upcoming pipeline seams but does not replace or alter the existing `EventHub`, replay engine, or SQLite-backed API flow. Kafka selection/configuration and runtime stage wiring are later phases. The default local demo therefore continues on its current path without importing a broker client.
 
+## Phase 3 implementation baseline
+
+`configs/kafka.yaml` adds disabled-by-default settings for loopback bootstrap servers, topic prefix, consumer group, and maximum event size. `configs/kafka.local.yaml` is Git-ignored. `CUSTODIAN_KAFKA_CONFIG` can select an additional YAML override, and `CUSTODIAN_KAFKA_*` variables override file values. Configuration validation rejects non-loopback broker endpoints for this local-only pilot.
+
+`compose.kafka.yaml` defines one opt-in Redpanda broker with a health check, one CPU core, persistent named data, and only the Kafka host port bound to `127.0.0.1:9092`. See `docs/kafka-local-pilot.md` for start/stop instructions. The broker and setting do not change runtime mode or enable live capture; Kafka transport implementation remains a later phase.
+
 ## Phase 1 exit criteria
 
 - Runtime event boundaries and current local persistence are mapped to the proposed stages.

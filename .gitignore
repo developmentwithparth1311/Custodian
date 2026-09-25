@@ -42,6 +42,7 @@ Desktop.ini
 .env.*
 !.env.example
 configs/*.local.yaml
+configs/kafka.local.yaml
 *.log
 *.db
 *.db-*

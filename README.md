@@ -280,11 +280,14 @@ Press `Ctrl+C` in the frontend terminal and then in the backend terminal.
 | `configs/replay.yaml` | Capture root, size limit, pacing, speed and telemetry interval |
 | `configs/models.yaml` | Conservative default model trust configuration |
 | `configs/models.demo.yaml` | Four-model localhost showcase configuration |
+| `configs/kafka.yaml` | Disabled-by-default optional local Kafka-compatible broker settings |
 | `configs/evidence.yaml` | Capability and evidence requirements per threat class |
 | `configs/severity.yaml` | Threat-to-severity policy |
 | `configs/storage.yaml` | SQLite path, retention and maximum size |
 
 `CUSTODIAN_MODELS_CONFIG` selects a model configuration filename within `configs/`. Machine-specific `*.local.yaml` files are ignored by Git.
+
+The optional Kafka-compatible broker is not required for replay. To start the local pilot broker, see [Local Kafka-compatible broker pilot](docs/kafka-local-pilot.md). Kafka settings remain disabled by default; Phase 3 adds configuration and the broker stack, while event transport wiring is introduced in subsequent phases.
 
 Do not mark an arbitrary artifact `trusted: true` merely to make the dashboard green. The trust flag means the local operator approved that exact package after reviewing provenance, hashes, schema compatibility and allowed use.
 
