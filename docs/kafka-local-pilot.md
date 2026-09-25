@@ -1,6 +1,6 @@
 # Local Kafka-compatible broker pilot
 
-Custodian's standard local PCAP replay does not need Kafka. The broker setup is opt-in and is not started by the application. Phase 4 adds optional Kafka transport adapters and publishes validated replay-stage metadata when Kafka is explicitly enabled. The existing in-process event hub, replay, and SQLite persistence remain active. Kafka consumers expose validated events to a separate processing component; PostgreSQL/Redis projection, idempotent consumer processing, and dead-letter retry handling are later work.
+Custodian's standard local PCAP replay does not need Kafka. The broker setup is opt-in and is not started by the application. Phase 4 adds optional Kafka transport adapters and publishes validated replay-stage metadata when Kafka is explicitly enabled. Phase 5 adds a bounded consumer worker with retry and dead-letter handling. The existing in-process event hub, replay, and SQLite persistence remain active. PostgreSQL/Redis projections and durable inbox-based idempotency remain later work.
 
 ## Start the local broker
 
@@ -52,7 +52,7 @@ Current configuration validation accepts loopback bootstrap addresses only, incl
 .venv/bin/python -m pip install -e '.[kafka]'
 ```
 
-The API probes the broker at startup and again before replay. When Kafka is enabled, the existing replay stages publish validated packet, flow, feature, verdict, alert, and lifecycle events. The in-process runtime and SQLite persistence remain active. A Kafka consumer can be created by a separate processing component; it must acknowledge a validated event after processing. Invalid messages are not committed and block that consumer until dead-letter handling is added in Phase 5.
+The API probes the broker at startup and again before replay. When Kafka is enabled, the existing replay stages publish validated packet, flow, feature, verdict, alert, and lifecycle events. The in-process runtime and SQLite persistence remain active. A Kafka consumer can be created by a separate processing component. `KafkaEventWorker` retries a handler a bounded number of times with capped exponential backoff. On exhaustion it publishes a sanitized dead-letter envelope and only then acknowledges the source event. Invalid or oversized input is dead-lettered without copying the original message; if dead-letter publishing fails, its source offset is not committed. Worker diagnostics expose processing, retry, and dead-letter counts. Handlers that write durable records must still use `event_id` as an idempotency key; the PostgreSQL inbox transaction is not implemented by this local pilot.
 
 ## Live broker integration check
 
@@ -62,6 +62,6 @@ The normal test suite uses Kafka client fakes. To run the opt-in end-to-end adap
 CUSTODIAN_KAFKA_INTEGRATION=1 .venv/bin/python -m pytest tests/integration/test_kafka_live.py
 ```
 
-The test provisions the versioned runtime-event topic if needed, publishes one metadata-only event, consumes it with a unique consumer group, validates its run/capture/correlation identifiers, and acknowledges it. Set `CUSTODIAN_KAFKA_BOOTSTRAP_SERVERS` to another loopback Kafka-compatible address if the broker uses a non-default port. The test does not run in the default suite and rejects non-loopback broker addresses through normal Kafka settings validation.
+The tests provision their versioned topics if needed, publish and consume a metadata-only runtime event, and send a malformed schema-only record through the sanitized dead-letter path. Set `CUSTODIAN_KAFKA_BOOTSTRAP_SERVERS` to another loopback Kafka-compatible address if the broker uses a non-default port. The tests do not run in the default suite and reject non-loopback broker addresses through normal Kafka settings validation.
 
 Do not put credentials, tokens, secrets, or remote broker addresses in the pilot configuration. The Compose file is for one-laptop development, not production deployment.

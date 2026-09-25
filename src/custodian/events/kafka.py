@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
-from time import monotonic
+from collections.abc import Callable
+from datetime import UTC, datetime
+from time import monotonic, sleep
 from typing import Any
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from custodian.config import KafkaSettings
-from custodian.events.bus import EventBackpressureError, EventBusError
-from custodian.events.contracts import EventType, PipelineEvent
+from custodian.events.bus import EventBackpressureError, EventBusError, EventPublisher
+from custodian.events.contracts import DeadLetterPayload, EventType, PipelineEvent
+
+MAX_HANDLER_ATTEMPTS = 10
 
 
 def _topic(prefix: str, event_type: EventType) -> str:
@@ -48,7 +53,7 @@ class KafkaEventPublisher:
         try:
             self._producer.list_topics(timeout=timeout_seconds)
         except Exception as exc:
-            self._last_error = str(exc)
+            self._last_error = "Kafka broker unavailable"
             raise EventBusError("Kafka broker is unavailable") from exc
         self._last_error = None
 
@@ -110,6 +115,7 @@ class KafkaEventConsumer:
         *,
         event_types: tuple[EventType, ...] = tuple(EventType),
         consumer: Any | None = None,
+        dead_letter_publisher: EventPublisher | None = None,
     ) -> None:
         self.settings = settings
         self.event_types = event_types
@@ -128,9 +134,11 @@ class KafkaEventConsumer:
                 }
             )
         self._consumer = consumer
+        self._dead_letter_publisher = dead_letter_publisher
         self._pending: dict[str, Any] = {}
         self._last_error: str | None = None
         self._blocked = False
+        self.dead_letter_count = 0
         topics = [_topic(settings.topic_prefix, event_type) for event_type in event_types]
         self._consumer.subscribe(topics)
 
@@ -139,7 +147,7 @@ class KafkaEventConsumer:
             raise ValueError("timeout_seconds must not be negative")
         if self._blocked:
             raise EventBusError(
-                "consumer is blocked on an invalid event; operator handling is required"
+                "consumer is blocked after dead-letter or offset commit failure; restart after recovery"
             )
         if self._pending:
             raise EventBusError("acknowledge the outstanding event before polling again")
@@ -158,9 +166,18 @@ class KafkaEventConsumer:
             if message.topic() != expected_topic:
                 raise ValueError("Kafka topic does not match the event type")
         except Exception as exc:
-            self._last_error = str(exc)
-            self._blocked = True
-            raise EventBusError("invalid Kafka event; offset was not acknowledged") from exc
+            self._last_error = (
+                "event exceeds configured size limit"
+                if "maximum size" in str(exc)
+                else "invalid event schema or topic"
+            )
+            try:
+                self._route_invalid_message(message, exc)
+            except Exception as dead_letter_error:
+                self._blocked = True
+                self._last_error = "dead-letter publish or source offset commit failed"
+                raise EventBusError(self._last_error) from dead_letter_error
+            return None
         self._pending[str(event.event_id)] = message
         self._last_error = None
         return event
@@ -174,6 +191,45 @@ class KafkaEventConsumer:
             raise EventBusError("Kafka consumer offset commit failed")
         del self._pending[str(event.event_id)]
 
+    def _route_invalid_message(self, message: Any, error: Exception) -> None:
+        """Publish sanitized failure metadata before committing a poison message."""
+        if self._dead_letter_publisher is None:
+            self._dead_letter_publisher = KafkaEventPublisher(self.settings)
+        too_large = "maximum size" in str(error)
+        dead_letter = PipelineEvent(
+            event_id=uuid5(
+                NAMESPACE_URL,
+                f"{message.topic()}:{getattr(message, 'partition', lambda: 0)()}:{getattr(message, 'offset', lambda: 0)()}",
+            ),
+            event_type=EventType.DEAD_LETTER,
+            schema_version="dead_letter.v1",
+            occurred_at=datetime.now(UTC),
+            run_id=uuid4(),
+            capture_id=None,
+            correlation_id=uuid4(),
+            sequence=1,
+            payload=DeadLetterPayload(
+                source_topic=message.topic(),
+                original_event_id=None,
+                failure_code="payload_too_large" if too_large else "invalid_event",
+                error_summary=(
+                    "payload exceeded maximum size" if too_large else "schema validation failed"
+                ),
+                attempt_count=1,
+            ).model_dump(mode="json"),
+        )
+        self._dead_letter_publisher.publish(dead_letter, timeout_seconds=5.0)
+        flush = getattr(self._dead_letter_publisher, "flush", None)
+        if flush is not None:
+            flush(timeout_seconds=5.0)
+        self._commit_message(message)
+        self.dead_letter_count += 1
+
+    def _commit_message(self, message: Any) -> None:
+        committed = self._consumer.commit(message=message, asynchronous=False)
+        if committed and any(getattr(partition, "error", None) for partition in committed):
+            raise EventBusError("Kafka consumer offset commit failed")
+
     def close(self) -> None:
         self._consumer.close()
 
@@ -184,6 +240,119 @@ class KafkaEventConsumer:
     @property
     def last_error(self) -> str | None:
         return self._last_error
+
+
+class KafkaEventWorker:
+    """Process one event at a time with bounded retries and a sanitized dead letter."""
+
+    def __init__(
+        self,
+        consumer: KafkaEventConsumer,
+        handler: Callable[[PipelineEvent], None],
+        dead_letter_publisher: EventPublisher,
+        *,
+        max_attempts: int = 3,
+        initial_backoff_seconds: float = 0.1,
+        max_backoff_seconds: float = 5.0,
+        sleep_fn: Callable[[float], None] = sleep,
+    ) -> None:
+        if not 1 <= max_attempts <= MAX_HANDLER_ATTEMPTS:
+            raise ValueError(f"max_attempts must be between 1 and {MAX_HANDLER_ATTEMPTS}")
+        if initial_backoff_seconds < 0:
+            raise ValueError("initial_backoff_seconds must not be negative")
+        if max_backoff_seconds < initial_backoff_seconds:
+            raise ValueError("max_backoff_seconds must be at least the initial backoff")
+        self.consumer = consumer
+        self.handler = handler
+        self.dead_letter_publisher = dead_letter_publisher
+        self.max_attempts = max_attempts
+        self.initial_backoff_seconds = initial_backoff_seconds
+        self.max_backoff_seconds = max_backoff_seconds
+        self._sleep = sleep_fn
+        self.processed_count = 0
+        self.retry_count = 0
+        self.dead_letter_count = 0
+        self.last_error: str | None = None
+
+    def process_next(self, *, timeout_seconds: float = 0.0) -> bool:
+        """Process one event. Return False on timeout; raise on transport/DLQ failure."""
+        event = self.consumer.poll(timeout_seconds=timeout_seconds)
+        if event is None:
+            return False
+
+        failed = False
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                self.handler(event)
+            except Exception:
+                failed = True
+                self.last_error = f"event processing failed after attempt {attempt}"
+                if attempt < self.max_attempts:
+                    self.retry_count += 1
+                    self._sleep(
+                        min(
+                            self.max_backoff_seconds,
+                            self.initial_backoff_seconds * (2 ** (attempt - 1)),
+                        )
+                    )
+                    continue
+            else:
+                try:
+                    self.consumer.ack(event)
+                except Exception as exc:
+                    self.last_error = "event processed but Kafka offset commit failed"
+                    raise EventBusError(self.last_error) from exc
+                self.processed_count += 1
+                self.last_error = None
+                return True
+
+        assert failed
+        dead_letter = PipelineEvent(
+            event_id=uuid5(event.event_id, "custodian.dead_letter.v1"),
+            event_type=EventType.DEAD_LETTER,
+            schema_version="dead_letter.v1",
+            occurred_at=datetime.now(UTC),
+            run_id=event.run_id,
+            capture_id=event.capture_id,
+            correlation_id=event.correlation_id,
+            sequence=event.sequence,
+            causation_id=event.event_id,
+            payload=DeadLetterPayload(
+                source_topic=_topic(self.consumer.settings.topic_prefix, event.event_type),
+                original_event_id=event.event_id,
+                failure_code="processing_failed",
+                error_summary="event processing failed",
+                attempt_count=self.max_attempts,
+            ).model_dump(mode="json"),
+        )
+        try:
+            self.dead_letter_publisher.publish(dead_letter, timeout_seconds=5.0)
+            flush = getattr(self.dead_letter_publisher, "flush", None)
+            if flush is not None:
+                flush(timeout_seconds=5.0)
+            self.consumer.ack(event)
+        except Exception as exc:
+            self.last_error = "failed to route event to dead-letter topic or commit source offset"
+            raise EventBusError(self.last_error) from exc
+
+        self.dead_letter_count += 1
+        self.last_error = "event moved to dead-letter topic after bounded retries"
+        return True
+
+    @property
+    def healthy(self) -> bool:
+        return self.last_error is None and self.consumer.healthy
+
+    @property
+    def diagnostics(self) -> dict[str, int | bool | str | None]:
+        return {
+            "healthy": self.healthy,
+            "consumer_healthy": self.consumer.healthy,
+            "processed_count": self.processed_count,
+            "retry_count": self.retry_count,
+            "dead_letter_count": self.dead_letter_count + self.consumer.dead_letter_count,
+            "last_error": self.last_error or self.consumer.last_error,
+        }
 
 
 class KafkaEventBus:
@@ -200,4 +369,9 @@ class KafkaEventBus:
             self.consumer.close()
 
 
-__all__ = ["KafkaEventBus", "KafkaEventConsumer", "KafkaEventPublisher"]
+__all__ = [
+    "KafkaEventBus",
+    "KafkaEventConsumer",
+    "KafkaEventPublisher",
+    "KafkaEventWorker",
+]
